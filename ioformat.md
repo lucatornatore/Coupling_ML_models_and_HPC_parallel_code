@@ -1,9 +1,15 @@
 # Gadget Format-2 I/O, Parallel Strategy, and Code-Unit Conversion
 
-This document records (a) the layout of the Gadget *Format-2* snapshot
-file as used by OpenGADGET3, (b) the parallel-I/O strategy planned for
-this project, and (c) how code units are translated to physical / CGS
-units in a cosmological context.
+*Note: written by Claude as documentation FOR BSC ( now CINECA) colleagues when asked to produce the data imported*
+
+--------
+
+
+
+This document records
+(a) the layout of the Gadget *Format-2* snapshot file as used by OpenGADGET3
+(b) the parallel-I/O strategy planned for this project
+(c) how code units are translated to physical / CGS units in a cosmological context.
 
 References point to the OpenGADGET3 tree at
 `/scratch/WORK/GADGET/STABLE/OpenGadget3/` (notably `IO/read_ic.cpp`,

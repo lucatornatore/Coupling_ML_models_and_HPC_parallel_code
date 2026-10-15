@@ -1,0 +1,535 @@
+// ---------------------------------------------------------------------
+//  src/io_gadget2.cpp -- implementation of mlhpc::GadgetReader2.
+//
+//  Implements the Format-2 reader described in ioformat.md sec. 1.
+//  The file is walked record-by-record using fseek/fread on a stdio
+//  FILE*; that is sufficient for this single-file reader and avoids
+//  any iostream overhead.
+//
+//  Endianness model:
+//      The first 4 bytes of any Format-2 file are a Fortran record
+//      marker whose *value* is the size of the label record == 8 in
+//      every well-formed file.  We read it in native byte order; if
+//      it comes out 8 the file matches the host's endianness, if it
+//      comes out 0x08000000 it is byte-swapped.  Any other value is
+//      a hard error.  Once detected, the swap flag is sticky for
+//      the lifetime of this reader.
+//
+//  Error policy:
+//      Every parse/I/O issue throws std::runtime_error.  Returning
+//      bool/error codes from every helper here would clutter the
+//      hot path; exceptions are caught at the top-level entry
+//      points of the harness.
+// ---------------------------------------------------------------------
+
+#include "mlhpc/io_gadget2.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
+namespace mlhpc
+{
+
+namespace
+{
+
+// ---------------------------------------------------------------------
+//  bswap32 / bswap64
+//
+//  Compiler-intrinsic byte-swap helpers.  We rely on GCC/Clang's
+//  __builtin_bswap*; both are constexpr-correct and emit a single
+//  bswap (or rev) instruction on every target we care about.
+// ---------------------------------------------------------------------
+inline std::uint32_t
+bswap32 (std::uint32_t v) noexcept
+{
+  return __builtin_bswap32 (v);
+}
+
+inline std::uint64_t
+bswap64 (std::uint64_t v) noexcept
+{
+  return __builtin_bswap64 (v);
+}
+
+// ---------------------------------------------------------------------
+//  swap_in_place
+//
+//  Byte-swap `count` consecutive elements of size `element_size` in
+//  the buffer `p`.  Used only when the file's endianness differs
+//  from the host's; called on every payload read in that case.
+//  element_size must be 1 (no-op), 2, 4 or 8.
+// ---------------------------------------------------------------------
+void
+swap_in_place (void        * __restrict p,
+               std::size_t   element_size,
+               std::size_t   count)
+{
+  if (element_size == 1)
+    {
+      return;
+    }
+
+  auto *bytes = static_cast<unsigned char *> (p);
+
+  switch (element_size)
+    {
+    case 2:
+      for (std::size_t i = 0; i < count; ++i)
+        {
+          auto *w = bytes + 2 * i;
+          std::swap (w[0], w[1]);
+        }
+      break;
+
+    case 4:
+      for (std::size_t i = 0; i < count; ++i)
+        {
+          auto *w = reinterpret_cast<std::uint32_t *> (bytes + 4 * i);
+          *w = bswap32 (*w);
+        }
+      break;
+
+    case 8:
+      for (std::size_t i = 0; i < count; ++i)
+        {
+          auto *w = reinterpret_cast<std::uint64_t *> (bytes + 8 * i);
+          *w = bswap64 (*w);
+        }
+      break;
+
+    default:
+      throw std::runtime_error (
+          "mlhpc::swap_in_place: unsupported element size "
+          + std::to_string (element_size));
+    }
+}
+
+// ---------------------------------------------------------------------
+//  fread_exact
+//
+//  Wrapper around std::fread that throws if fewer than `nbytes`
+//  bytes were read.  Avoids the ubiquitous "ignored short read"
+//  bug in C I/O code.
+// ---------------------------------------------------------------------
+void
+fread_exact (void              *dst,
+             std::size_t        nbytes,
+             std::FILE         *fp,
+             const std::string &path,
+             const char        *what)
+{
+  const std::size_t got = std::fread (dst, 1, nbytes, fp);
+  if (got != nbytes)
+    {
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: short read of " + std::string (what)
+          + " in '" + path + "' (got " + std::to_string (got)
+          + " bytes, expected " + std::to_string (nbytes) + ")");
+    }
+}
+
+// ---------------------------------------------------------------------
+//  read_marker_u32
+//
+//  Read a 4-byte Fortran record marker, byte-swap it if the file's
+//  endianness has already been determined to differ from host.
+//  The first call from the constructor passes swap=false because the
+//  swap flag is precisely what this marker is going to tell us.
+// ---------------------------------------------------------------------
+std::uint32_t
+read_marker_u32 (std::FILE         *fp,
+                 bool               swap,
+                 const std::string &path,
+                 const char        *what)
+{
+  std::uint32_t m = 0;
+  fread_exact (&m, sizeof (m), fp, path, what);
+  return swap ? bswap32 (m) : m;
+}
+
+}  // anonymous namespace
+
+// =====================================================================
+//  GadgetReader2 -- ctor/dtor
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  GadgetReader2 (constructor)
+//
+//  Open the file, detect endianness from the first record marker,
+//  consume the HEAD label record, then read the 256-byte header and
+//  byte-swap it if needed.  After construction the file pointer is
+//  positioned immediately after the header's trailing record marker,
+//  i.e. at the first byte of the first non-header block label.
+//
+//  Inputs:  path -- filesystem path of the Format-2 snapshot file.
+//  Throws:  std::runtime_error on any open / parse / I/O failure.
+// ---------------------------------------------------------------------
+GadgetReader2::GadgetReader2 (const std::string &path)
+  : path_ (path)
+  , fp_   (nullptr)
+  , swap_ (false)
+{
+  fp_ = std::fopen (path.c_str (), "rb");
+  if (fp_ == nullptr)
+    {
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: cannot open '" + path + "' for reading");
+    }
+
+  // --- endianness detection -----------------------------------------
+  // The first 4 bytes are the leading Fortran record marker of the
+  // HEAD label record.  Its expected value is 8 (4 bytes of tag +
+  // 4 bytes of nextblock).  If we instead read 0x08000000, the file
+  // is byte-swapped relative to the host.
+  std::uint32_t first = 0;
+  fread_exact (&first, sizeof (first), fp_, path_, "leading marker");
+
+  if (first == 8u)
+    {
+      swap_ = false;
+    }
+  else if (bswap32 (first) == 8u)
+    {
+      swap_ = true;
+    }
+  else
+    {
+      std::fclose (fp_);
+      fp_ = nullptr;
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: '" + path
+          + "' does not look like a Gadget Format-2 file "
+            "(leading record marker = " + std::to_string (first)
+          + ", expected 8 or 0x08000000)");
+    }
+
+  // --- HEAD label record content ------------------------------------
+  // We're past the leading marker.  Read the 4-char tag, the
+  // uint32 nextblock, and the trailing 4-byte marker.  Sanity-check
+  // the tag and the markers as we go.
+  char           head_tag [4]  = {};
+  std::uint32_t  head_nextblk  = 0;
+  fread_exact (head_tag,      sizeof (head_tag),     fp_, path_, "HEAD tag");
+  fread_exact (&head_nextblk, sizeof (head_nextblk), fp_, path_, "HEAD nextblock");
+  if (swap_)
+    {
+      head_nextblk = bswap32 (head_nextblk);
+    }
+
+  if (std::memcmp (head_tag, "HEAD", 4) != 0)
+    {
+      std::fclose (fp_);
+      fp_ = nullptr;
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: '" + path
+          + "' first label is not 'HEAD' (got '"
+          + std::string (head_tag, 4) + "')");
+    }
+
+  const std::uint32_t head_trail =
+      read_marker_u32 (fp_, swap_, path_, "HEAD trailing marker");
+  if (head_trail != 8u)
+    {
+      std::fclose (fp_);
+      fp_ = nullptr;
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: '" + path
+          + "': HEAD label trailing marker = " + std::to_string (head_trail)
+          + ", expected 8");
+    }
+
+  // --- header data record -------------------------------------------
+  // The data record wrapping the 256-byte header: leading marker
+  // (must be 256), payload, trailing marker (must match).
+  const std::uint32_t hdr_lead =
+      read_marker_u32 (fp_, swap_, path_, "header leading marker");
+  if (hdr_lead != sizeof (GadgetHeader2))
+    {
+      std::fclose (fp_);
+      fp_ = nullptr;
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: '" + path
+          + "': header leading marker = " + std::to_string (hdr_lead)
+          + ", expected " + std::to_string (sizeof (GadgetHeader2)));
+    }
+
+  fread_exact (&header_, sizeof (header_), fp_, path_, "header bytes");
+
+  if (swap_)
+    {
+      // Each header field, swapped according to its width.  We do
+      // this field-by-field instead of "swap every uint32" because
+      // the header is a heterogeneous struct: uint32[6], double[6],
+      // double, double, int32[2], uint32[6], int32, int32, double[4],
+      // int32[2], uint32[6], int32[3], float, char[48].
+      swap_in_place (header_.npart,                6, 4);
+      swap_in_place (header_.mass,                 6, 8);
+      swap_in_place (&header_.time,                1, 8);
+      swap_in_place (&header_.redshift,            1, 8);
+      swap_in_place (&header_.flag_sfr,            1, 4);
+      swap_in_place (&header_.flag_feedback,       1, 4);
+      swap_in_place (header_.npartTotal,           6, 4);
+      swap_in_place (&header_.flag_cooling,        1, 4);
+      swap_in_place (&header_.num_files,           1, 4);
+      swap_in_place (&header_.BoxSize,             1, 8);
+      swap_in_place (&header_.Omega0,              1, 8);
+      swap_in_place (&header_.OmegaLambda,         1, 8);
+      swap_in_place (&header_.HubbleParam,         1, 8);
+      swap_in_place (&header_.flag_stellarage,     1, 4);
+      swap_in_place (&header_.flag_metals,         1, 4);
+      swap_in_place (header_.npartTotalHighWord,   6, 4);
+      swap_in_place (&header_.flag_entropy_instead_u, 1, 4);
+      swap_in_place (&header_.flag_doubleprecision,   1, 4);
+      swap_in_place (&header_.flag_ic_info,        1, 4);
+      swap_in_place (&header_.lpt_scalingfactor,   1, 4);
+      // `fill` is opaque padding; we leave it as-is.
+    }
+
+  const std::uint32_t hdr_trail =
+      read_marker_u32 (fp_, swap_, path_, "header trailing marker");
+  if (hdr_trail != sizeof (GadgetHeader2))
+    {
+      std::fclose (fp_);
+      fp_ = nullptr;
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: '" + path
+          + "': header trailing marker = " + std::to_string (hdr_trail)
+          + ", expected " + std::to_string (sizeof (GadgetHeader2)));
+    }
+
+  // File pointer is now positioned at the leading marker of the next
+  // label record.  seek_block() will start its scan from here.
+}
+
+// ---------------------------------------------------------------------
+//  GadgetReader2 (destructor) -- close the FILE* if still owned.
+// ---------------------------------------------------------------------
+GadgetReader2::~GadgetReader2 ()
+{
+  if (fp_ != nullptr)
+    {
+      std::fclose (fp_);
+      fp_ = nullptr;
+    }
+}
+
+// =====================================================================
+//  Block walking
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seek_block
+//
+//  Walk the file from the current position, label by label, until
+//  either the requested tag is found or EOF is reached.  On a match
+//  we record the payload offset and size, leave the file pointer at
+//  the start of the payload (so a subsequent read_payload* can read
+//  immediately), and return true.  On EOF, return false.
+//
+//  Note: we currently always *restart* the scan from immediately
+//  after the header, because blocks can be requested in any order
+//  by the caller and the scan cost is dominated by the seek-only
+//  passes (we never read payload bytes here).
+//
+//  Inputs:  tag  -- 4-char tag of the desired block (with trailing
+//                   spaces if shorter, e.g. "POS ").
+//  Output:  out  -- populated on success with payload location/size.
+//  Returns: true if found, false if scanned to EOF without a match.
+//  Throws:  on I/O / parse error other than EOF.
+// ---------------------------------------------------------------------
+bool
+GadgetReader2::seek_block (const char  tag [4],
+                           BlockInfo  &out)
+{
+  // Restart the scan from just after the header record.  The header
+  // record occupies: 4 (leading marker) + 8 (HEAD label) + 4
+  // (trailing marker) + 4 (header leading marker) + 256 (header)
+  // + 4 (header trailing marker) = 280 bytes.
+  constexpr long header_record_bytes = 4 + 8 + 4 + 4 + 256 + 4;
+  if (std::fseek (fp_, header_record_bytes, SEEK_SET) != 0)
+    {
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: '" + path_
+          + "': fseek past header failed");
+    }
+
+  while (true)
+    {
+      // -- read the next label record ---------------------------------
+      std::uint32_t lead_marker = 0;
+      const std::size_t got =
+          std::fread (&lead_marker, 1, sizeof (lead_marker), fp_);
+      if (got == 0 && std::feof (fp_))
+        {
+          return false;          // clean EOF, tag not found
+        }
+      if (got != sizeof (lead_marker))
+        {
+          throw std::runtime_error (
+              "mlhpc::GadgetReader2: '" + path_
+              + "': short read on label leading marker");
+        }
+      if (swap_)
+        {
+          lead_marker = bswap32 (lead_marker);
+        }
+      if (lead_marker != 8u)
+        {
+          throw std::runtime_error (
+              "mlhpc::GadgetReader2: '" + path_
+              + "': label leading marker = "
+              + std::to_string (lead_marker) + ", expected 8");
+        }
+
+      char           cur_tag [4]    = {};
+      std::uint32_t  cur_nextblk    = 0;
+      fread_exact (cur_tag,      sizeof (cur_tag),     fp_, path_, "label tag");
+      fread_exact (&cur_nextblk, sizeof (cur_nextblk), fp_, path_, "label nextblock");
+      if (swap_)
+        {
+          cur_nextblk = bswap32 (cur_nextblk);
+        }
+
+      const std::uint32_t trail_marker =
+          read_marker_u32 (fp_, swap_, path_, "label trailing marker");
+      if (trail_marker != 8u)
+        {
+          throw std::runtime_error (
+              "mlhpc::GadgetReader2: '" + path_
+              + "': label trailing marker = "
+              + std::to_string (trail_marker) + ", expected 8");
+        }
+
+      // -- read the data record's leading marker (the payload size) --
+      const std::uint32_t data_lead =
+          read_marker_u32 (fp_, swap_, path_, "data leading marker");
+
+      // payload starts at the *current* file position
+      const long payload_pos = std::ftell (fp_);
+      if (payload_pos < 0)
+        {
+          throw std::runtime_error (
+              "mlhpc::GadgetReader2: '" + path_ + "': ftell failed");
+        }
+
+      if (std::memcmp (cur_tag, tag, 4) == 0)
+        {
+          out.payload_offset = static_cast<std::size_t> (payload_pos);
+          out.payload_size   = data_lead;
+          std::memcpy (out.tag, cur_tag, 4);
+          return true;
+        }
+
+      // Not the one we want -- skip over the payload + trailing
+      // marker and continue to the next label.
+      if (std::fseek (fp_, static_cast<long> (data_lead) + 4, SEEK_CUR) != 0)
+        {
+          throw std::runtime_error (
+              "mlhpc::GadgetReader2: '" + path_
+              + "': fseek past block payload failed");
+        }
+    }
+}
+
+// =====================================================================
+//  Payload reads
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  read_payload
+//
+//  Common implementation behind the typed convenience wrappers.
+//  Seeks to the requested offset inside the block payload, reads
+//  the requested number of bytes, and byte-swaps each element if
+//  the file's endianness differs from the host's.
+//
+//  Inputs:  blk                -- block info populated by seek_block()
+//           local_offset_bytes -- byte offset *within* the payload
+//           count              -- number of elements to read
+//           element_size       -- bytes per element (1, 2, 4 or 8)
+//           dst                -- destination buffer; caller-owned
+//  Throws:  std::runtime_error on bounds or I/O failure.
+// ---------------------------------------------------------------------
+void
+GadgetReader2::read_payload (const BlockInfo  &blk,
+                             std::size_t       local_offset_bytes,
+                             std::size_t       count,
+                             std::size_t       element_size,
+                             void             *dst)
+{
+  const std::size_t nbytes = count * element_size;
+  if (local_offset_bytes + nbytes > blk.payload_size)
+    {
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: read out of bounds in block '"
+          + std::string (blk.tag, 4) + "' ("
+          + std::to_string (local_offset_bytes) + " + "
+          + std::to_string (nbytes) + " > "
+          + std::to_string (blk.payload_size) + ")");
+    }
+
+  const long target =
+      static_cast<long> (blk.payload_offset + local_offset_bytes);
+  if (std::fseek (fp_, target, SEEK_SET) != 0)
+    {
+      throw std::runtime_error (
+          "mlhpc::GadgetReader2: fseek to payload offset "
+          + std::to_string (target) + " failed");
+    }
+
+  fread_exact (dst, nbytes, fp_, path_, "block payload");
+
+  if (swap_)
+    {
+      swap_in_place (dst, element_size, count);
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Typed wrappers -- thin layer over read_payload() for call-site
+//  clarity.
+// ---------------------------------------------------------------------
+void
+GadgetReader2::read_payload_floats (const BlockInfo  &blk,
+                                    std::size_t       local_offset_bytes,
+                                    std::size_t       count,
+                                    float            *dst)
+{
+  read_payload (blk, local_offset_bytes, count, sizeof (float), dst);
+}
+
+void
+GadgetReader2::read_payload_doubles (const BlockInfo  &blk,
+                                     std::size_t       local_offset_bytes,
+                                     std::size_t       count,
+                                     double           *dst)
+{
+  read_payload (blk, local_offset_bytes, count, sizeof (double), dst);
+}
+
+void
+GadgetReader2::read_payload_uint32 (const BlockInfo  &blk,
+                                    std::size_t       local_offset_bytes,
+                                    std::size_t       count,
+                                    std::uint32_t    *dst)
+{
+  read_payload (blk, local_offset_bytes, count, sizeof (std::uint32_t), dst);
+}
+
+void
+GadgetReader2::read_payload_uint64 (const BlockInfo  &blk,
+                                    std::size_t       local_offset_bytes,
+                                    std::size_t       count,
+                                    std::uint64_t    *dst)
+{
+  read_payload (blk, local_offset_bytes, count, sizeof (std::uint64_t), dst);
+}
+
+}  // namespace mlhpc

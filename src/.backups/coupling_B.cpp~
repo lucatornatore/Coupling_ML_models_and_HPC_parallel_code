@@ -1,0 +1,439 @@
+// ---------------------------------------------------------------------
+//  src/coupling_B.cpp -- Case B coupling implementation.
+//
+//  Case B reserves a contiguous block of MPI_COMM_WORLD ranks as the
+//  inference pool; the remaining ranks ("physics ranks") read the
+//  snapshot, build particle batches, and send each batch as a query
+//  to one assigned inference rank, then block on the answer.  This
+//  is the first of the two true coupling cases (the other being C);
+//  case A's "every rank does inference locally" was the baseline.
+//
+//  Layout (world size N, pool size P, 1 <= P < N):
+//      ranks  [0       , N - P)  : physics (own particles)
+//      ranks  [N - P   , N    )  : inference (own no particles)
+//
+//  Assignment: physics rank at position p (0..N-P-1) in physics_comm
+//  is routed to inference rank `(N - P) + (p % P)` in MPI_COMM_WORLD.
+//  Round-robin keeps load balanced when P does not divide N - P.
+//
+//  Wire format is defined in include/mlhpc/detail/coupling_wire.hpp
+//  and is shared verbatim with case C; see that header for the
+//  message layout and tag conventions.
+//
+//  Shutdown protocol: each physics rank, in its `shutdown()` call,
+//  sends a one-shot QueryHeader with the HDR_SHUTDOWN flag bit set
+//  to its assigned inference rank.  Each inference rank knows how
+//  many physics ranks are assigned to it (`expected_queries()`); its
+//  `serve()` loop exits when it has counted that many shutdowns.
+//
+//  Empty-quota pool members: an inference rank whose pool index has
+//  `expected_queries() == 0` (which happens when pool_size > number
+//  of physics ranks, possible at the boundary) returns from `serve()`
+//  immediately.  Without this short-circuit it would block forever on
+//  a Recv that nobody will satisfy.
+//
+//  Timing breakdown (filled into `Timings` per rank):
+//      physics:   send  = MPI_Send (header + payload) time
+//                 wait  = MPI_Recv (answer) time
+//                 kernel = 0    (kernel does not run on physics)
+//                 total = send + wait
+//      inference: wait  = MPI_Recv (header + payload) time
+//                 kernel = backend.batch_inference time
+//                 send  = MPI_Send (answer) time
+//                 total = wait + kernel + send  (per iteration)
+//      Both:      n_calls counts processed batches; shutdown sentinels
+//                 are NOT counted as work.
+//
+//  Future tightening (deferred): non-blocking sends to overlap with
+//  packing, persistent communication (MPI_Send_init), shared-memory
+//  windows for the physics-rank-to-inference-rank path when both
+//  live on the same node (this is the main case-C optimisation; see
+//  coupling_C.cpp once implemented).
+// ---------------------------------------------------------------------
+
+#include "mlhpc/coupling.hpp"
+
+#include "mlhpc/detail/coupling_wire.hpp"
+#include "mlhpc/inference.hpp"
+#include "mlhpc/particle_batch.hpp"
+#include "mlhpc/types.hpp"
+
+#include <mpi.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+
+namespace mlhpc
+{
+
+namespace
+{
+
+// Bring the shared wire-format names into the file scope so the rest
+// of the TU reads naturally (e.g. `make_query_header`, `TAG_QUERY`).
+using detail::QueryHeader;
+using detail::HDR_SHUTDOWN;
+using detail::TAG_QUERY;
+using detail::TAG_DATA;
+using detail::TAG_ANSWER;
+using detail::mpi_real_dtype;
+using detail::make_query_header;
+using detail::wire_payload_size;
+using detail::pack_payload;
+using detail::unpack_payload;
+
+// ---------------------------------------------------------------------
+//  expected_queries
+//
+//  How many *physics* ranks are assigned (modulo pool_size) to
+//  inference pool index `j` in [0, pool_size).  Returns 0 when no
+//  physics rank lands on this pool index, e.g. when pool_size exceeds
+//  the count of physics ranks.
+//
+//  Inputs:
+//      pool_base : world rank at which the inference pool starts
+//                  (== world_size - pool_size; also the count of
+//                  physics ranks).
+//      pool_size : count of inference ranks.
+//      j         : pool index of the inference rank in question
+//                  (== world_rank - pool_base).
+// ---------------------------------------------------------------------
+int
+expected_queries (         int       pool_base,
+                           int       pool_size,
+                           int       j) noexcept
+{
+  if (j >= pool_base) return 0;
+  return (pool_base - 1 - j) / pool_size + 1;
+}
+
+// ---------------------------------------------------------------------
+//  CouplingB -- the actual case-B implementation.  File-static,
+//  exposed only through make_coupling().
+// ---------------------------------------------------------------------
+class CouplingB final : public Coupling
+{
+public:
+
+  // -------------------------------------------------------------------
+  //  Constructor.  Collective on `world`.
+  //
+  //  Builds a private duplicate of `world` (so we own a stable
+  //  handle), validates the pool size against the world size,
+  //  computes per-rank role and pool index, and splits the world
+  //  into physics_comm (color 0) and a discarded inference sub-comm
+  //  (color 1) ordered by world rank.  Aborts on invalid
+  //  configuration.
+  // -------------------------------------------------------------------
+  CouplingB (         MPI_Comm                  world,
+             const    CouplingConfig           &cfg)
+    : m_world         (MPI_COMM_NULL),
+      m_phys_comm     (MPI_COMM_NULL),
+      m_world_rank    (0),
+      m_world_size    (0),
+      m_pool_size     (cfg.inference_pool_size),
+      m_pool_base     (0),
+      m_pool_index    (-1),
+      m_is_inference  (false)
+  {
+    if (MPI_Comm_dup (world, &m_world) != MPI_SUCCESS)
+      {
+        std::fprintf (stderr,
+                      "CouplingB: MPI_Comm_dup (world) failed; aborting.\n");
+        MPI_Abort (world, 11);
+      }
+    MPI_Comm_rank (m_world, &m_world_rank);
+    MPI_Comm_size (m_world, &m_world_size);
+
+    if (m_pool_size < 1 || m_pool_size >= m_world_size)
+      {
+        if (m_world_rank == 0)
+          {
+            std::fprintf (stderr,
+                          "CouplingB: invalid inference_pool_size=%d "
+                          "for world_size=%d "
+                          "(need 1 <= pool_size < world_size).\n",
+                          m_pool_size, m_world_size);
+          }
+        MPI_Abort (world, 12);
+      }
+
+    m_pool_base    = m_world_size - m_pool_size;
+    m_is_inference = (m_world_rank >= m_pool_base);
+    if (m_is_inference)
+      {
+        m_pool_index = m_world_rank - m_pool_base;
+      }
+
+    // Collective on m_world: color 0 -> physics, color 1 -> inference.
+    // key = world_rank so the sub-communicator's rank ordering matches
+    // the world's, which makes the round-robin assignment below
+    // independent of whatever MPI_Comm_split's implementation picks.
+    const int  color = m_is_inference ? 1 : 0;
+    const int  key   = m_world_rank;
+    MPI_Comm   split_comm = MPI_COMM_NULL;
+    if (MPI_Comm_split (m_world, color, key, &split_comm) != MPI_SUCCESS)
+      {
+        std::fprintf (stderr,
+                      "CouplingB: MPI_Comm_split failed (rank %d).\n",
+                      m_world_rank);
+        MPI_Abort (world, 13);
+      }
+
+    if (m_is_inference)
+      {
+        // We don't currently need an inter-pool communicator for B.
+        // Free it so the handle doesn't leak; future-C will likely
+        // want one.
+        MPI_Comm_free (&split_comm);
+      }
+    else
+      {
+        m_phys_comm = split_comm;
+      }
+  }
+
+  ~CouplingB () override
+  {
+    if (m_phys_comm != MPI_COMM_NULL) MPI_Comm_free (&m_phys_comm);
+    if (m_world     != MPI_COMM_NULL) MPI_Comm_free (&m_world);
+  }
+
+  // -------------------------------------------------------------------
+  //  Trivial accessors.
+  // -------------------------------------------------------------------
+  MPI_Comm
+  physics_comm () const noexcept override
+  {
+    return m_phys_comm;
+  }
+
+  bool
+  is_physics () const noexcept override
+  {
+    return !m_is_inference;
+  }
+
+  bool
+  is_inference () const noexcept override
+  {
+    return m_is_inference;
+  }
+
+  // -------------------------------------------------------------------
+  //  evaluate -- physics-rank entry point for case B.
+  //
+  //  Packs the batch into a header + flat payload (via the detail
+  //  wire helpers), sends both to the assigned inference rank, blocks
+  //  on the answer.  Per-phase timings are accumulated in m_timings.
+  // -------------------------------------------------------------------
+  void
+  evaluate (const ParticleBatch       &batch,    // in
+            Real *__restrict           out,      // out
+            const InferenceBackend    &/*backend*/   // unused on physics side
+           ) const override
+  {
+    if (m_is_inference)
+      {
+        throw std::logic_error
+          ("CouplingB::evaluate called on an inference rank.");
+      }
+
+    int  phys_rank = 0;
+    MPI_Comm_rank (m_phys_comm, &phys_rank);
+    const int  target = m_pool_base + (phys_rank % m_pool_size);
+
+    const QueryHeader  hdr    = make_query_header (batch);
+    const std::size_t  wire_n = wire_payload_size (hdr);
+    std::vector<Real>  wire (wire_n);
+    pack_payload (batch, hdr, wire);
+
+    // ---- send header (and payload, if non-empty) --------------------
+    const double  t_send_start = MPI_Wtime ();
+    MPI_Send (&hdr, static_cast<int> (sizeof (hdr)),
+              MPI_BYTE, target, TAG_QUERY, m_world);
+    if (wire_n > 0)
+      {
+        MPI_Send (wire.data (), static_cast<int> (wire_n),
+                  mpi_real_dtype (),
+                  target, TAG_DATA, m_world);
+      }
+    const double  t_send_end = MPI_Wtime ();
+
+    // ---- receive answer ---------------------------------------------
+    if (batch.n > 0)
+      {
+        MPI_Recv (out, static_cast<int> (batch.n), mpi_real_dtype (),
+                  target, TAG_ANSWER, m_world, MPI_STATUS_IGNORE);
+      }
+    const double  t_recv_end = MPI_Wtime ();
+
+    m_timings.send    += (t_send_end - t_send_start);
+    m_timings.wait    += (t_recv_end - t_send_end);
+    m_timings.total   += (t_recv_end - t_send_start);
+    m_timings.n_calls += 1;
+  }
+
+  // -------------------------------------------------------------------
+  //  serve -- inference-rank entry point for case B.
+  //
+  //  Blocks in a Recv/process/Send loop until every physics rank that
+  //  is assigned to this pool index has signalled shutdown.  An
+  //  inference rank whose pool index has no assigned physics ranks
+  //  returns immediately.
+  // -------------------------------------------------------------------
+  void
+  serve (const InferenceBackend &backend) const override
+  {
+    if (!m_is_inference)
+      {
+        throw std::logic_error
+          ("CouplingB::serve called on a physics rank.");
+      }
+
+    const int  expected =
+        expected_queries (m_pool_base, m_pool_size, m_pool_index);
+    if (expected == 0)
+      {
+        // Nobody will ever talk to us; return so the rank can reach
+        // MPI_Finalize.
+        return;
+      }
+
+    int                shutdowns = 0;
+    std::vector<Real>  wire;
+    std::vector<Real>  out_buf;
+    ParticleBatch      batch;
+
+    while (true)
+      {
+        const double  t_iter_start = MPI_Wtime ();
+
+        MPI_Status   status {};
+        QueryHeader  hdr {};
+        MPI_Recv (&hdr, static_cast<int> (sizeof (hdr)),
+                  MPI_BYTE, MPI_ANY_SOURCE, TAG_QUERY,
+                  m_world, &status);
+        const int  src = status.MPI_SOURCE;
+
+        // Shutdown sentinel: count and break when we've received one
+        // from every assigned physics rank.  Not counted as work.
+        if (hdr.flags & HDR_SHUTDOWN)
+          {
+            shutdowns += 1;
+            if (shutdowns >= expected) break;
+            continue;
+          }
+
+        // ---- receive payload (skipped if hdr.n == 0) ---------------
+        const std::size_t  wire_n = wire_payload_size (hdr);
+        wire.resize (wire_n);
+        if (hdr.n > 0)
+          {
+            MPI_Recv (wire.data (), static_cast<int> (wire_n),
+                      mpi_real_dtype (), src, TAG_DATA, m_world,
+                      MPI_STATUS_IGNORE);
+          }
+        const double  t_recv_end = MPI_Wtime ();
+        m_timings.wait += (t_recv_end - t_iter_start);
+
+        // ---- unpack into a ParticleBatch ---------------------------
+        unpack_payload (hdr, wire, batch);
+
+        // ---- run the inference kernel ------------------------------
+        out_buf.resize (batch.n);
+        const double  t_kernel_start = MPI_Wtime ();
+        backend.batch_inference (batch, out_buf.data ());
+        const double  t_kernel_end   = MPI_Wtime ();
+        m_timings.kernel += (t_kernel_end - t_kernel_start);
+
+        // ---- send the answer back ----------------------------------
+        if (batch.n > 0)
+          {
+            MPI_Send (out_buf.data (), static_cast<int> (batch.n),
+                      mpi_real_dtype (), src, TAG_ANSWER, m_world);
+          }
+        const double  t_iter_end = MPI_Wtime ();
+        m_timings.send    += (t_iter_end - t_kernel_end);
+        m_timings.total   += (t_iter_end - t_iter_start);
+        m_timings.n_calls += 1;
+      }
+  }
+
+  // -------------------------------------------------------------------
+  //  shutdown -- per-rank one-shot drain signal.
+  //
+  //  Called on every rank exactly once at the end of the harness'
+  //  useful work.  On physics ranks: send a SHUTDOWN-flagged header
+  //  to the assigned inference rank.  On inference ranks: no-op (we
+  //  have already returned from serve() by the time we reach here).
+  //  Idempotent.
+  // -------------------------------------------------------------------
+  void
+  shutdown () const override
+  {
+    if (m_already_shutdown) return;
+    m_already_shutdown = true;
+    if (m_is_inference) return;
+
+    int  phys_rank = 0;
+    MPI_Comm_rank (m_phys_comm, &phys_rank);
+    const int  target = m_pool_base + (phys_rank % m_pool_size);
+
+    QueryHeader  hdr {};
+    hdr.flags = HDR_SHUTDOWN;
+    MPI_Send (&hdr, static_cast<int> (sizeof (hdr)),
+              MPI_BYTE, target, TAG_QUERY, m_world);
+  }
+
+  // -------------------------------------------------------------------
+  //  timings -- snapshot of accumulated wall-clock counters.
+  // -------------------------------------------------------------------
+  Timings
+  timings () const noexcept override
+  {
+    return m_timings;
+  }
+
+private:
+
+  // --- communicator handles (owned; freed in dtor) ---------------------
+                  MPI_Comm        m_world;
+                  MPI_Comm        m_phys_comm;        // MPI_COMM_NULL on inference ranks
+
+  // --- precomputed pool layout ----------------------------------------
+                  int             m_world_rank;
+                  int             m_world_size;
+                  int             m_pool_size;
+                  int             m_pool_base;        // world_size - pool_size
+                  int             m_pool_index;       // valid only if m_is_inference
+                  bool            m_is_inference;
+
+  // --- mutable bookkeeping (touched from const methods) ----------------
+  mutable         bool            m_already_shutdown { false };
+  mutable         Timings         m_timings          { };
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------
+//  Factory body for case B.  Cases A and C provide their own
+//  definitions; the Makefile picks exactly one.
+// ---------------------------------------------------------------------
+std::unique_ptr<Coupling>
+make_coupling (         MPI_Comm                  world,
+               const    CouplingConfig           &cfg)
+{
+  return std::unique_ptr<Coupling> (new CouplingB (world, cfg));
+}
+
+const char *
+compiled_case_label () noexcept
+{
+  return "B";
+}
+
+}  // namespace mlhpc

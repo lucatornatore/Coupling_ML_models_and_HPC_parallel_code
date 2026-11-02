@@ -12,7 +12,6 @@
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
-        "CMAKE_CXX_COMPILER": "g++",
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "ENABLE_TESTING": true,
@@ -28,13 +27,28 @@
     },
     {
       "name": "case-a",
+      "displayName": "A: local / native dummy / Debug / tests ON",
+      "description": "Configure local inference on every rank using native C++ dummy arithmetic. Debug build with unit and MPI tests enabled; no ONNX dependency.",
       "inherits": "base",
       "cacheVariables": {
         "MLHPC_CASE": "A"
       }
     },
     {
+      "name": "case-a-onnx-debug",
+      "displayName": "A: local / ONNX CPU / Debug (-O0 -g) / tests ON",
+      "description": "Configure Case A with ONNX Runtime CPU, the compiler/MPI environment supplied by the user, -O0 -g, and models/dummy.onnx. The matching build preset builds only test_coupling_A and its dependencies.",
+      "inherits": "case-a-onnx",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g",
+        "MLHPC_ONNX_MODEL": "${sourceDir}/models/dummy.onnx"
+      }
+    },
+    {
       "name": "case-b",
+      "displayName": "B: MPI service / native dummy / Debug / tests ON",
+      "description": "Configure physics clients and inference servers using native C++ dummy arithmetic. Debug build with tests enabled; defaults to one server rank per node, with dedicated server nodes selectable at runtime.",
       "inherits": "base",
       "cacheVariables": {
         "MLHPC_CASE": "B"
@@ -42,6 +56,8 @@
     },
     {
       "name": "case-a-onnx",
+      "displayName": "A: local / ONNX CPU / Debug / tests ON",
+      "description": "Configure local ONNX Runtime CPU inference on every rank and download the pinned runtime. Enables native-reference comparison and coupling tests; MLHPC_ONNX_MODEL supplies the rho/u compatibility model.",
       "inherits": "case-a",
       "cacheVariables": {
         "MLHPC_BACKEND": "ONNX",
@@ -51,6 +67,8 @@
     },
     {
       "name": "case-b-onnx",
+      "displayName": "B: MPI service / ONNX CPU / Debug / tests ON",
+      "description": "Configure ONNX Runtime CPU inference on server ranks only and download the pinned runtime. Enables native-reference comparison and MPI round-trip tests; MLHPC_ONNX_MODEL supplies the rho/u compatibility model. Server placement is selected at runtime.",
       "inherits": "case-b",
       "cacheVariables": {
         "MLHPC_BACKEND": "ONNX",
@@ -60,6 +78,8 @@
     },
     {
       "name": "case-a-no-tests",
+      "displayName": "A: local / native dummy / RelWithDebInfo / tests OFF",
+      "description": "Configure optimized local native-dummy inference with debug symbols. Builds the application without test targets or ONNX dependencies.",
       "inherits": "case-a",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
@@ -68,6 +88,8 @@
     },
     {
       "name": "case-b-no-tests",
+      "displayName": "B: MPI service / native dummy / RelWithDebInfo / tests OFF",
+      "description": "Configure optimized native-dummy client/server inference with debug symbols and no tests. Server placement remains a runtime choice.",
       "inherits": "case-b",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
@@ -76,6 +98,8 @@
     },
     {
       "name": "case-a-onnx-no-tests",
+      "displayName": "A: local / ONNX CPU / RelWithDebInfo / tests OFF",
+      "description": "Configure optimized local ONNX Runtime CPU inference with debug symbols and a pinned runtime download. No tests or native-dummy reference are built; pass the model path when running the application.",
       "inherits": "case-a-onnx",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
@@ -84,6 +108,8 @@
     },
     {
       "name": "case-b-onnx-no-tests",
+      "displayName": "B: MPI service / ONNX CPU / RelWithDebInfo / tests OFF",
+      "description": "Configure optimized server-side ONNX Runtime CPU inference with debug symbols and a pinned runtime download. No tests or native-dummy reference are built; model path and server placement are runtime inputs.",
       "inherits": "case-b-onnx",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
@@ -99,41 +125,65 @@
     },
     {
       "name": "case-a",
+      "displayName": "Build A: native dummy / application + tests / Debug",
+      "description": "Build the application and all enabled tests in build/case-a. Does not execute tests.",
       "inherits": "base-build",
       "configurePreset": "case-a"
     },
     {
+      "name": "case-a-onnx-debug",
+      "displayName": "Build A: ONNX CPU / test_coupling_A only / Debug",
+      "description": "Build only test_coupling_A and its dependencies in build/case-a-onnx-debug using two jobs. Intended for interactive stepping; does not launch the debugger or run the test.",
+      "configurePreset": "case-a-onnx-debug",
+      "jobs": 2,
+      "targets": ["test_coupling_A"]
+    },
+    {
       "name": "case-b",
+      "displayName": "Build B: native dummy / application + tests / Debug",
+      "description": "Build the application and all enabled tests in build/case-b. Does not execute tests.",
       "inherits": "base-build",
       "configurePreset": "case-b"
     },
     {
       "name": "case-a-onnx",
+      "displayName": "Build A: ONNX CPU / application + comparison tests / Debug",
+      "description": "Build the ONNX-selected application, native reference, and all enabled tests in build/case-a-onnx. The native reference is linked into tests, not the application. Does not execute tests.",
       "inherits": "base-build",
       "configurePreset": "case-a-onnx"
     },
     {
       "name": "case-b-onnx",
+      "displayName": "Build B: ONNX CPU / application + comparison tests / Debug",
+      "description": "Build the ONNX-selected service application, native reference, and all enabled tests in build/case-b-onnx. The native reference is linked into tests, not the application. Does not execute tests.",
       "inherits": "base-build",
       "configurePreset": "case-b-onnx"
     },
     {
       "name": "case-a-no-tests",
+      "displayName": "Build A: native dummy / no tests / RelWithDebInfo",
+      "description": "Build the optimized native-dummy application and its libraries in build/case-a-no-tests. No test executables are built.",
       "inherits": "base-build",
       "configurePreset": "case-a-no-tests"
     },
     {
       "name": "case-b-no-tests",
+      "displayName": "Build B: native dummy / no tests / RelWithDebInfo",
+      "description": "Build the optimized native-dummy service application and its libraries in build/case-b-no-tests. No test executables are built.",
       "inherits": "base-build",
       "configurePreset": "case-b-no-tests"
     },
     {
       "name": "case-a-onnx-no-tests",
+      "displayName": "Build A: ONNX CPU / no tests / RelWithDebInfo",
+      "description": "Build the optimized ONNX application and its libraries in build/case-a-onnx-no-tests. No test executables or native-dummy implementation are built.",
       "inherits": "base-build",
       "configurePreset": "case-a-onnx-no-tests"
     },
     {
       "name": "case-b-onnx-no-tests",
+      "displayName": "Build B: ONNX CPU / no tests / RelWithDebInfo",
+      "description": "Build the optimized ONNX service application and its libraries in build/case-b-onnx-no-tests. No test executables or native-dummy implementation are built.",
       "inherits": "base-build",
       "configurePreset": "case-b-onnx-no-tests"
     }
@@ -151,6 +201,8 @@
     },
     {
       "name": "case-a-unit",
+      "displayName": "Test A: unit suite / native dummy / no MPI launcher",
+      "description": "Run tests labeled unit from build/case-a, including native dummy inference. Does not launch multiple MPI ranks.",
       "inherits": "base-test",
       "configurePreset": "case-a",
       "filter": {
@@ -161,6 +213,8 @@
     },
     {
       "name": "case-a-mpi",
+      "displayName": "Test A: MPI suite / local native-dummy coupling + startup",
+      "description": "Run tests labeled mpi from build/case-a using four ranks by default, including snapshot distribution, local coupling, and startup/shutdown. Use a one-node allocation; the inactive B coupling test self-skips.",
       "inherits": "base-test",
       "configurePreset": "case-a",
       "filter": {
@@ -171,6 +225,8 @@
     },
     {
       "name": "case-b-unit",
+      "displayName": "Test B: unit suite / native dummy / no MPI launcher",
+      "description": "Run tests labeled unit from build/case-b, including native dummy inference. Does not launch multiple MPI ranks.",
       "inherits": "base-test",
       "configurePreset": "case-b",
       "filter": {
@@ -181,6 +237,8 @@
     },
     {
       "name": "case-b-mpi",
+      "displayName": "Test B: MPI suite / native-dummy round-trip + startup",
+      "description": "Run tests labeled mpi from build/case-b using four ranks by default, including snapshot distribution, local-server coupling, and startup/shutdown. Use a one-node allocation; the inactive A coupling test self-skips.",
       "inherits": "base-test",
       "configurePreset": "case-b",
       "filter": {
@@ -191,6 +249,8 @@
     },
     {
       "name": "case-a-onnx",
+      "displayName": "Test A: ONNX vs native dummy / standalone, no MPI transport",
+      "description": "Run the standalone ONNX/native-dummy comparison from build/case-a-onnx on synthetic rho/u batches. Tests numerical agreement and input checks, not MPI communication.",
       "inherits": "base-test",
       "configurePreset": "case-a-onnx",
       "filter": {
@@ -201,6 +261,8 @@
     },
     {
       "name": "case-b-onnx",
+      "displayName": "Test B: ONNX vs native dummy / standalone, no MPI transport",
+      "description": "Run the standalone ONNX/native-dummy comparison from build/case-b-onnx on synthetic rho/u batches. Selecting the B build does not make this standalone test use MPI transport.",
       "inherits": "base-test",
       "configurePreset": "case-b-onnx",
       "filter": {
@@ -211,6 +273,8 @@
     },
     {
       "name": "case-a-onnx-mpi",
+      "displayName": "Test A: local ONNX coupling vs native reference + startup",
+      "description": "Run the active Case A coupling test and application smoke test using four ranks by default. Inference is local to each rank; the smoke test only checks startup/shutdown. Excludes snapshot distribution.",
       "inherits": "base-test",
       "configurePreset": "case-a-onnx",
       "filter": {
@@ -221,6 +285,8 @@
     },
     {
       "name": "case-b-onnx-mpi",
+      "displayName": "Test B: MPI ONNX round-trip vs native reference + startup",
+      "description": "Run the active Case B coupling test and application smoke test using four ranks by default. Synthetic chunks travel through real MPI to local server ranks running ONNX; clients own no engine. Excludes snapshot distribution.",
       "inherits": "base-test",
       "configurePreset": "case-b-onnx",
       "filter": {
